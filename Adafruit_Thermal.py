@@ -45,6 +45,7 @@
 from machine import UART
 import utime
 import sys
+import io
 
 
 class BitmapHeader:
@@ -115,10 +116,12 @@ class Adafruit_Thermal:
         # Fallback to regular +,- operator in case
         # utime.ticks_add and/or utime.ticks_diff are unavailable.
         self.ticks_diff = (
-            utime.ticks_diff if hasattr(utime, "ticks_diff") else lambda x, y: x - y
+            # utime.ticks_diff if hasattr(utime, "ticks_diff") else lambda x, y: x - y
+            lambda x, y: x - y
         )
         self.ticks_add = (
-            utime.ticks_add if hasattr(utime, "ticks_add") else lambda x, y: x + y
+            # utime.ticks_add if hasattr(utime, "ticks_add") else lambda x, y: x + y
+            lambda x, y: x + y
         )
 
         # Calculate time to issue one byte to the printer.
@@ -207,11 +210,11 @@ class Adafruit_Thermal:
 
     # Sets estimated completion time for a just-issued task.
     def timeoutSet(self, x):
-        self.resumeTime = self.ticks_add(utime.ticks_ms(), x)
+        self.resumeTime = self.ticks_add(utime.ticks_us(), x / 10)
 
     # Waits (if necessary) for the prior task to complete.
     def timeoutWait(self):
-        while self.ticks_diff(utime.ticks_ms(), self.resumeTime) < 0:
+        while self.ticks_diff(utime.ticks_us(), self.resumeTime) < 0:
             pass
 
     # Printer performance may vary based on the power supply voltage,
@@ -592,6 +595,68 @@ class Adafruit_Thermal:
     def printBMPImage(self, filename, LaaT=False):
         try:
             with open(filename, "rb") as bmp_file:
+                header = BitmapHeader(bmp_file.read(BitmapHeader.SIZE_IN_BYTES))
+                header_info = BitmapHeaderInfo(
+                    bmp_file.read(BitmapHeaderInfo.SIZE_IN_BYTES)
+                )
+
+                data_end = header.file_size - 2
+
+                if header_info.width_in_bytes >= 48:
+                    rowBytesClipped = 48  # 384 pixels max width
+                else:
+                    rowBytesClipped = header_info.width_in_bytes
+
+                # if LaaT (line-at-a-time) is True, print bitmaps
+                # scanline-at-a-time (rather than in chunks).
+                # This tends to make for much cleaner printing
+                # (no feed gaps) on large images...but has the
+                # opposite effect on small images that would fit
+                # in a single 'chunk', so use carefully!
+                if LaaT:
+                    maxChunkHeight = 1
+                else:
+                    maxChunkHeight = 50  # lower max chunk (not 255) for memory-constrained systems (LoPy v1)
+
+                for startRow in range(0, header_info.height, maxChunkHeight):
+                    chunkHeight = header_info.height - startRow
+                    if chunkHeight > maxChunkHeight:
+                        chunkHeight = maxChunkHeight
+
+                    # Timeout wait happens here
+                    self.writeBytes(18, 42, chunkHeight, rowBytesClipped)
+                    for row in range(startRow + 1, startRow + 1 + chunkHeight):
+                        # seek to beginning of line
+                        bmp_file.seek(data_end - row * header_info.line_width)
+
+                        # read the whole line
+                        if (
+                            header_info.last_byte_padding == 0
+                            or header_info.width_in_bytes <= rowBytesClipped
+                        ):
+                            line = bytearray(bmp_file.read(rowBytesClipped))
+                            self.timeoutWait()
+                            self.timeoutSet(self.dotPrintTime)
+                            self.uart.write(line)
+                        else:
+                            self.timeoutWait()
+                            self.timeoutSet(self.dotPrintTime)
+                            if rowBytesClipped > 1:
+                                line = bytearray(bmp_file.read(rowBytesClipped - 1))
+                                self.uart.write(line)
+
+                            data = bmp_file.read(1)
+                            mask = 0xFF << header_info.last_byte_padding & 0xFF
+                            self.uart.write(bytes([ord(data) & mask]))
+
+                self.prevByte = "\n"
+
+        except OSError as e:
+            print("error: {}".format(e))
+
+    def printBMPBinary(self, bin, LaaT=False):
+        try:
+            with io.BytesIO(bin) as bmp_file:
                 header = BitmapHeader(bmp_file.read(BitmapHeader.SIZE_IN_BYTES))
                 header_info = BitmapHeaderInfo(
                     bmp_file.read(BitmapHeaderInfo.SIZE_IN_BYTES)
